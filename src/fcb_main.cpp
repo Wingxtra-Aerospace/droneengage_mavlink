@@ -32,7 +32,9 @@
 using Json_de = nlohmann::json;
 using namespace de::fcb;
 
-#define UDP_PROXY_TIMEOUT 5000000
+#define UDP_PROXY_TIMEOUT 30000000
+#define UDP_PROXY_RECOVERY_RETRY_INTERVAL 5000000
+#define UDP_PROXY_RECOVERY_ATTEMPTS_MAX 12
 
 /**
  * @brief Message received from UDP Proxy
@@ -637,9 +639,8 @@ void CFCBMain::loopScheduler() {
       m_fcb_facade.sendMissionItemSequence(std::to_string(mission_current.seq));
     }
 
-    if (m_counter % 1500 == 0) { // 15 sec
-
-      
+    if (m_counter % 500 == 0) { // 5 sec
+      processUdpProxyRecovery();
     }
   }
 
@@ -679,13 +680,15 @@ void CFCBMain::OnMessageReceived(const mavlink_message_t &mavlink_message, const
     // if streaming active check each message to forward. Messages are forwarded regardless of the processed_by_vehicle flag.
     // of being processed by vehicle or not.
     if (m_mavlink_optimizer.shouldForwardThisMessage(mavlink_message)) {
-      // UdpProxy
       const u_int64_t now = get_time_usec();
       const u_int64_t last_access_duration = (now - m_last_access_telemetry);
+      const bool recent_udp_activity =
+          (last_access_duration < UDP_PROXY_TIMEOUT);
+      const bool force_streaming =
+          (m_udp_proxy_requested_enabled && (!m_udp_proxy.paused));
 
-      // stop sending mavlink if no one is sending back. except heartbeat
-      // messages.
-      if ((last_access_duration < UDP_PROXY_TIMEOUT) ||
+      // Keep full MAVLink stream while telemetry is requested and proxy is resumed.
+      if (force_streaming || recent_udp_activity ||
           (mavlink_message.msgid == MAVLINK_MSG_ID_HEARTBEAT)) {
         m_fcb_facade.sendUdpProxyMavlink(mavlink_message,
                                          m_udp_proxy.udp_client);
@@ -1122,6 +1125,8 @@ void CFCBMain::OnParamReceivedCompleted() {
  */
 void CFCBMain::OnConnectionStatusChangedWithAndruavServer(const int status) {
 
+  m_andruav_server_status = status;
+
   switch (status) {
   case SOCKET_STATUS_FREASH: {
   } break;
@@ -1137,11 +1142,9 @@ void CFCBMain::OnConnectionStatusChangedWithAndruavServer(const int status) {
 
     m_fcb_facade.callModule_reloadSavedTasks(TYPE_AndruavSystem_LoadTasks);
 
-    // open or close -if open- udpProxy once connection with communication
-    // server is established.
-    m_fcb_facade.requestUdpProxyTelemetry(m_udp_proxy_requested_enabled,
-                                          "0.0.0.0", 0, "0.0.0.0",
-                                          m_udp_telemetry_fixed_port);
+    m_udp_proxy_request_retry_count = 0;
+    m_last_udp_proxy_request_time = 0;
+    requestUdpProxyRecovery("andruav socket registered");
     // Json_de json_msg = sendMREMSG(TYPE_AndruavSystem_LoadTasks);
     // const std::string msg = json_msg.dump();
     // CUDPProxy.sendMSG(msg.c_str(), msg.length());
@@ -1150,22 +1153,26 @@ void CFCBMain::OnConnectionStatusChangedWithAndruavServer(const int status) {
   case SOCKET_STATUS_UNREGISTERED: {
     PLOG(plog::warning)
         << "Communicator Server Connection Status: SOCKET_STATUS_UNREGISTERED";
+    m_udp_proxy.enabled = false;
   } break;
 
   case SOCKET_STATUS_ERROR: {
     PLOG(plog::error)
         << "Communicator Server Connection Status: SOCKET_STATUS_ERROR";
+    m_udp_proxy.enabled = false;
     alertDroneEngageOffline();
   } break;
 
   case SOCKET_STATUS_DISCONNECTING: {
     PLOG(plog::warning)
         << "Communicator Server Connection Status: SOCKET_STATUS_DISCONNECTING";
+    m_udp_proxy.enabled = false;
   } break;
 
   case SOCKET_STATUS_DISCONNECTED: {
     PLOG(plog::warning)
         << "Communicator Server Connection Status: SOCKET_STATUS_DISCONNECTED";
+    m_udp_proxy.enabled = false;
     alertDroneEngageOffline();
   } break;
 
@@ -1173,6 +1180,7 @@ void CFCBMain::OnConnectionStatusChangedWithAndruavServer(const int status) {
     PLOG(plog::warning)
         << "Communicator Server Connection Status: Unknonwn State "
         << std::to_string(status);
+    m_udp_proxy.enabled = false;
     alertDroneEngageOffline();
   } break;
   }
@@ -1775,6 +1783,53 @@ void CFCBMain::checkBlockedStatus() {
   }
 }
 
+void CFCBMain::requestUdpProxyRecovery(const char *reason) {
+
+  if (!m_udp_proxy_requested_enabled)
+    return;
+
+  if (m_andruav_server_status != SOCKET_STATUS_REGISTERED)
+    return;
+
+  const u_int64_t now = get_time_usec();
+  if ((m_last_udp_proxy_request_time != 0) &&
+      ((now - m_last_udp_proxy_request_time) <
+       UDP_PROXY_RECOVERY_RETRY_INTERVAL)) {
+    return;
+  }
+
+  if (m_udp_proxy_request_retry_count >= UDP_PROXY_RECOVERY_ATTEMPTS_MAX) {
+    // Keep trying slowly after max retries to avoid staying permanently inactive.
+    if ((m_last_udp_proxy_request_time != 0) &&
+        ((now - m_last_udp_proxy_request_time) <
+         (UDP_PROXY_RECOVERY_RETRY_INTERVAL * 6))) {
+      return;
+    }
+    m_udp_proxy_request_retry_count = 0;
+  }
+
+  m_udp_proxy_request_retry_count++;
+  m_last_udp_proxy_request_time = now;
+
+  PLOG(plog::warning) << "UdpProxy recovery request #"
+                      << std::to_string(m_udp_proxy_request_retry_count)
+                      << " reason=" << reason;
+
+  m_fcb_facade.requestUdpProxyTelemetry(true, "0.0.0.0", 0, "0.0.0.0",
+                                        m_udp_telemetry_fixed_port);
+}
+
+void CFCBMain::processUdpProxyRecovery() {
+
+  if (!m_udp_proxy_requested_enabled)
+    return;
+
+  if (m_udp_proxy.enabled)
+    return;
+
+  requestUdpProxyRecovery("watchdog: udp proxy inactive");
+}
+
 void CFCBMain::heartbeatCamera() {
   /**
    * This is used to tell Ardupilot that there is a camera in the system
@@ -1802,12 +1857,21 @@ void CFCBMain::updateUDPProxy(const bool &enabled, const std::string &udp_ip1,
     if (m_udp_proxy.udp_client.init(udp_ip1.c_str(), udp_port1, "0.0.0.0", 0)) {
       m_udp_proxy.udp_client.start();
       m_udp_proxy.enabled = true;
+      m_udp_proxy_request_retry_count = 0;
+      m_last_udp_proxy_request_time = 0;
+      m_last_access_telemetry = get_time_usec();
     } else {
       m_udp_proxy.enabled = false;
+      PLOG(plog::error) << "UdpProxy local socket init failed";
+      requestUdpProxyRecovery("local udp socket init failed");
     }
   } else {
     m_udp_proxy.udp_client.stop();
     m_udp_proxy.enabled = false;
+
+    if (m_udp_proxy_requested_enabled) {
+      requestUdpProxyRecovery("remote udp proxy disabled unexpectedly");
+    }
   }
   
   m_udp_proxy.udp_ip1 = udp_ip1;
@@ -1848,4 +1912,7 @@ void CFCBMain::requestChangeUDPProxyClientPort(
   m_fcb_facade.requestUdpProxyTelemetry(
       m_udp_proxy_requested_enabled, m_udp_proxy.udp_ip1, m_udp_proxy.udp_port1,
       m_udp_proxy.udp_ip2, udp_proxy_fixed_port);
+
+  m_last_udp_proxy_request_time = 0;
+  requestUdpProxyRecovery("udp proxy fixed port changed");
 }

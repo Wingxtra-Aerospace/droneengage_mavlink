@@ -249,6 +249,8 @@ namespace fcb
             void calculateChannels(const int16_t scaled_channels[16], const bool ignode_dead_band, int16_t *output);
             void update_rcmap_info();
             void checkBlockedStatus();
+            void requestUdpProxyRecovery(const char* reason);
+            void processUdpProxyRecovery();
             /**
              * @brief emulate a camera for ardupilot.
              * 
@@ -282,6 +284,9 @@ namespace fcb
             bool m_udp_proxy_requested_enabled = false;
             uint16_t m_udp_telemetry_fixed_port = 0;
             uint64_t m_last_access_telemetry = 0;
+            uint64_t m_last_udp_proxy_request_time = 0;
+            uint32_t m_udp_proxy_request_retry_count = 0;
+            int m_andruav_server_status = SOCKET_STATUS_FREASH;
             ANDRUAV_UDP_PROXY m_udp_proxy;
 
 
